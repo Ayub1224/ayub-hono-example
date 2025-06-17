@@ -1,31 +1,132 @@
 name: Deploy to AWS Lambda
+
 on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
+    types: [closed]
+
+env:
+  AWS_REGION: us-east-1
+  FUNCTION_NAME: project-01-hono
+  NODE_VERSION: '20'
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          
       - name: Install dependencies
-        run: npm install
-      - name: Clean build
-        run: rm -f index.js
+        run: |
+          npm ci --only=production
+          
+      - name: Clean previous builds
+        run: |
+          rm -f index.js function.zip
+          
       - name: Build with esbuild
-        run: npx esbuild src/index.js --bundle --platform=node --target=node20 --outfile=index.js
-      - name: Zip Lambda code
-        run: zip -j function.zip index.js
+        run: |
+          npx esbuild src/index.js \
+            --bundle \
+            --platform=node \
+            --target=node20 \
+            --format=cjs \
+            --outfile=index.js \
+            --external:aws-sdk \
+            --minify
+            
+      - name: Verify build output
+        run: |
+          if [ ! -f index.js ]; then
+            echo "Build failed: index.js not found"
+            exit 1
+          fi
+          echo "Build successful. File size: $(du -h index.js)"
+          
+      - name: Create deployment package
+        run: |
+          zip -j function.zip index.js
+          echo "Package created. Size: $(du -h function.zip)"
+          
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
+          
       - name: Deploy to AWS Lambda
-        run: aws lambda update-function-code --function-name project-01-hono --zip-file fileb://function.zip
+        run: |
+          echo "Deploying to Lambda function: ${{ env.FUNCTION_NAME }}"
+          aws lambda update-function-code \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --zip-file fileb://function.zip \
+            --region ${{ env.AWS_REGION }}
+            
+      - name: Wait for deployment to complete
+        run: |
+          echo "Waiting for deployment to complete..."
+          aws lambda wait function-updated \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --region ${{ env.AWS_REGION }}
+          echo "Deployment completed successfully!"
+          
+      - name: Get function info
+        run: |
+          aws lambda get-function \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Configuration.{FunctionName:FunctionName,Runtime:Runtime,LastModified:LastModified,CodeSize:CodeSize}' \
+            --output table
+            
+      - name: Test deployment (optional)
+        run: |
+          echo "Testing Lambda function..."
+          aws lambda invoke \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --payload '{}' \
+            --cli-binary-format raw-in-base64-out \
+            response.json
+          echo "Response:"
+          cat response.json
+        continue-on-error: true
+
+  # Optional: Create a release on successful deployment
+  create-release:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body: |
+            Automated deployment to AWS Lambda
+            - Function: project-01-hono
+            - Region: us-east-1
+            - Commit: ${{ github.sha }}
+          draft: false
+          prerelease: false
+        continue-on-error: true
